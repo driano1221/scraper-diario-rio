@@ -57,43 +57,4 @@ jobs:
         git add edicoes_baixadas.json
         git diff --staged --quiet || git commit -m "Atualiza controle de edições"
         git push
-```
 
----
-
-## **🎯 O QUE MUDOU**
-
-✅ **Arquivo de controle:** `edicoes_baixadas.json`
-- Guarda lista de edições já baixadas
-- Commitado no repositório
-
-✅ **Lógica inteligente:**
-- Só baixa edições NOVAS
-- Evita duplicatas
-
-✅ **Eficiência:**
-- Se já tem tudo: não gasta minutos
-- Se tem 1 nova: baixa só 1
-
----
-
-## **📊 EXEMPLO PRÁTICO**
-
-**Hoje (primeira vez):**
-```
-Baixa: 7688-7697 (10 edições)
-Arquivo: edicoes_baixadas.json = [7688,7689,...,7697]
-```
-
-**Amanhã:**
-```
-Última: 7698
-Range: 7689-7698
-Já tem: 7689-7697
-Baixa só: 7698 (1 edição) ✅
-```
-
-**Depois de amanhã:**
-```
-Última: 7699
-Baixa só: 7699 (1 edição) ✅
