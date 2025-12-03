@@ -1,0 +1,40 @@
+name: Scraper Diário Oficial
+
+on:
+  schedule:
+    # Roda todo dia às 09:00 UTC (que é 06:00 da manhã no Brasil)
+    # Cron syntax: minuto hora dia mês dia-da-semana
+    - cron: '0 9 * * *'
+  workflow_dispatch: # Permite você clicar num botão para rodar manualmente se quiser
+
+permissions:
+  contents: write
+
+jobs:
+  baixar-diarios:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Baixar código
+        uses: actions/checkout@v4
+
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Instalar dependências
+        run: |
+          pip install -r requirements.txt
+
+      - name: 🚀 Rodar Scraper
+        run: python new.py
+
+      # OPÇÃO 1: SALVAR COMO ARTEFATO (Recomendado)
+      # Os arquivos ficam disponíveis para download no site do GitHub por 90 dias
+      - name: 💾 Upload dos PDFs (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Diarios-Rio-PDFs
+          path: Diarios_Rio_PDF/
+          retention-days: 10
