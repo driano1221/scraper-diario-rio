@@ -1,223 +1,164 @@
-import os
 import asyncio
+import shutil
 import aiohttp
 import aiofiles
 import fitz  # PyMuPDF
+import json
+from pathlib import Path
 from tqdm.asyncio import tqdm
 import nest_asyncio
-import shutil
-import re
-import json
-from datetime import datetime
 
 nest_asyncio.apply()
 
+# --- CONFIGURAÇÕES ---
 BASE_URL = "https://doweb.rio.rj.gov.br"
+OUTPUT_DIR = Path("Diarios_Rio_PDF")
+TEMP_DIR = OUTPUT_DIR / "temp_chunks"
+HISTORY_FILE = Path("historico.json")
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
+MAX_CONCURRENT = 30
+RETRIES = 3
 
-MAX_CONCURRENT = 50
-TIMEOUT_SECS = 60
-
-# Arquivo para controlar edições já baixadas
-CONTROLE_FILE = "edicoes_baixadas.json"
-
-def carregar_edicoes_baixadas():
-    """Carrega lista de edições já baixadas."""
-    if os.path.exists(CONTROLE_FILE):
-        with open(CONTROLE_FILE, 'r') as f:
-            return set(json.load(f))
+# --- GESTÃO DE HISTÓRICO (MEMÓRIA DO ROBÔ) ---
+def carregar_historico():
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                return set(json.load(f))
+        except:
+            return set()
     return set()
 
-def salvar_edicoes_baixadas(edicoes):
-    """Salva lista de edições baixadas."""
-    with open(CONTROLE_FILE, 'w') as f:
-        json.dump(sorted(list(edicoes)), f)
+def salvar_historico(novos_ids):
+    historico_atual = carregar_historico()
+    historico_atual.update(novos_ids)
+    # Salva lista ordenada
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(sorted(list(historico_atual)), f, indent=4)
 
-async def descobrir_ultima_edicao_site(session):
-    """Extrai o número da última edição diretamente da página inicial."""
-    print("🔍 Buscando última edição na página inicial...")
-    
-    try:
-        async with session.get(BASE_URL) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                
-                match = re.search(r'let DADOS_ULTIMAS_EDICOES = ({.*?});', html)
-                if match:
-                    dados = json.loads(match.group(1))
-                    if dados.get('itens') and len(dados['itens']) > 0:
-                        for item in dados['itens']:
-                            if item.get('suplemento') == 0:
-                                ultima_edicao = int(item['id'])
-                                print(f"✅ Última edição encontrada: {ultima_edicao}")
-                                return ultima_edicao
-                        
-                        ultima_edicao = int(dados['itens'][0]['id'])
-                        print(f"✅ Última edição encontrada: {ultima_edicao}")
-                        return ultima_edicao
-    except Exception as e:
-        print(f"⚠️ Erro ao buscar página inicial: {e}")
-    
+# --- FUNÇÕES DE REDE E PDF (Mesmas da versão anterior otimizada) ---
+async def fetch_with_retry(session, url, method="GET"):
+    for attempt in range(RETRIES):
+        try:
+            async with session.request(method, url, timeout=aiohttp.ClientTimeout(total=45)) as resp:
+                if resp.status == 200:
+                    return True if method == "HEAD" else await resp.read()
+                elif resp.status == 404:
+                    return None
+                if resp.status >= 500: await asyncio.sleep(0.5)
+        except: await asyncio.sleep(0.5)
     return None
 
-async def descobrir_total_paginas(session, edicao_id):
-    """Busca binária para descobrir total de páginas."""
-    low, high = 1, 3000
-    ultima = 0
-
-    url_1 = f"{BASE_URL}/apifront/portal/edicoes/pdf_diario/{edicao_id}/1"
-    try:
-        async with session.head(url_1) as resp:
-            if resp.status != 200: return 0
-    except: return 0
-
+async def get_page_count(session, ed_id):
+    if not await fetch_with_retry(session, f"{BASE_URL}/apifront/portal/edicoes/pdf_diario/{ed_id}/1", "HEAD"):
+        return 0
+    low, high, last = 1, 3000, 0
     while low <= high:
         mid = (low + high) // 2
-        url = f"{BASE_URL}/apifront/portal/edicoes/pdf_diario/{edicao_id}/{mid}"
-        try:
-            async with session.head(url, timeout=5) as resp:
-                if resp.status == 200 and 'application/pdf' in resp.headers.get('Content-Type', ''):
-                    ultima = mid
-                    low = mid + 1
-                else:
-                    high = mid - 1
-        except:
-            high = mid - 1
-    return ultima
+        if await fetch_with_retry(session, f"{BASE_URL}/apifront/portal/edicoes/pdf_diario/{ed_id}/{mid}", "HEAD"):
+            last, low = mid, mid + 1
+        else: high = mid - 1
+    return last
 
-async def baixar_pagina_pdf(session, sem, edicao_id, pagina, pasta_cache):
-    """Baixa uma página PDF e salva no cache."""
-    arquivo_pdf = f"{pasta_cache}/pag_{pagina:04d}.pdf"
-
-    if os.path.exists(arquivo_pdf):
-        return pagina, True
-
-    url = f"{BASE_URL}/apifront/portal/edicoes/pdf_diario/{edicao_id}/{pagina}"
-    
+async def download_page(session, sem, ed_id, page, dest):
+    url = f"{BASE_URL}/apifront/portal/edicoes/pdf_diario/{ed_id}/{page}"
     async with sem:
+        content = await fetch_with_retry(session, url)
+        if content and content.startswith(b'%PDF'):
+            async with aiofiles.open(dest, 'wb') as f: await f.write(content)
+            return True
+    return False
+
+def fast_merge_pdfs(pdf_list, output_path):
+    doc = fitz.open()
+    for p in pdf_list:
         try:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    pdf_bytes = await resp.read()
-                    
-                    async with aiofiles.open(arquivo_pdf, 'wb') as f:
-                        await f.write(pdf_bytes)
-                    
-                    return pagina, False
-        except Exception:
-            pass
-            
-    return pagina, None
+            with fitz.open(p) as temp: doc.insert_pdf(temp)
+        except: pass
+    doc.save(output_path, garbage=0, deflate=False)
+    doc.close()
 
-def consolidar_pdfs(pasta_cache, total_paginas, arquivo_final):
-    """Junta todos os PDFs individuais em um único arquivo PDF."""
-    pdf_final = fitz.open()
+async def process_edition(session, ed_id, sem, executor):
+    print(f"📥 Baixando Edição {ed_id}...", end=" ")
+    total = await get_page_count(session, ed_id)
+    if not total:
+        print("(Vazia)")
+        return False
+
+    temp_path = TEMP_DIR / str(ed_id)
+    temp_path.mkdir(parents=True, exist_ok=True)
     
-    for p in range(1, total_paginas + 1):
-        caminho_pdf = f"{pasta_cache}/pag_{p:04d}.pdf"
-        
-        if os.path.exists(caminho_pdf):
-            try:
-                pdf_temp = fitz.open(caminho_pdf)
-                pdf_final.insert_pdf(pdf_temp)
-                pdf_temp.close()
-            except Exception as e:
-                print(f"⚠️ Erro ao adicionar página {p}: {e}")
+    tasks = [download_page(session, sem, ed_id, p, temp_path / f"{p:04d}.pdf") for p in range(1, total + 1)]
+    results = [await t for t in tqdm(asyncio.as_completed(tasks), total=total, desc="Páginas", leave=False)]
+
+    if not any(results):
+        shutil.rmtree(temp_path, ignore_errors=True)
+        return False
+
+    final_pdf = OUTPUT_DIR / f"DO_Rio_{ed_id}.pdf"
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(executor, fast_merge_pdfs, sorted(temp_path.glob("*.pdf"), key=lambda x: int(x.stem)), final_pdf)
     
-    pdf_final.save(arquivo_final)
-    pdf_final.close()
+    shutil.rmtree(temp_path, ignore_errors=True)
+    print("✅ OK")
+    return True
 
-async def processar_edicao(edicao_id):
-    print(f"\n{'='*50}")
-    print(f"🚀 PROCESSANDO EDIÇÃO {edicao_id}")
-    
-    pasta_raiz = "Diarios_Rio"
-    pasta_cache = f"{pasta_raiz}/cache_{edicao_id}"
-    os.makedirs(pasta_cache, exist_ok=True)
-    
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, force_close=True)
-    sem = asyncio.Semaphore(MAX_CONCURRENT)
-    
-    async with aiohttp.ClientSession(headers=HEADERS, timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECS), connector=connector) as session:
-        
-        print("📊 Verificando total de páginas...", end=" ")
-        total = await descobrir_total_paginas(session, edicao_id)
-        print(f"Total: {total} páginas")
-        
-        if total == 0:
-            print("❌ Edição vazia ou erro de conexão.")
-            return False
-
-        print("⬇️ Iniciando download dos PDFs...")
-        tasks = [
-            baixar_pagina_pdf(session, sem, edicao_id, p, pasta_cache) 
-            for p in range(1, total + 1)
-        ]
-        
-        novos = 0
-        cache = 0
-        falhas = 0
-        
-        for coro in tqdm(asyncio.as_completed(tasks), total=total, unit="pág", desc="Progresso"):
-            pag, status = await coro
-            if status is True: cache += 1
-            elif status is False: novos += 1
-            else: falhas += 1
-
-        print(f"\nResumo: {novos} baixados | {cache} cache | {falhas} falhas")
-
-        print("📑 Gerando PDF final...")
-        arquivo_final = f"{pasta_raiz}/DO_Rio_{edicao_id}_COMPLETO.pdf"
-        
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, consolidar_pdfs, pasta_cache, total, arquivo_final)
-
-        print(f"✅ SUCESSO! Arquivo: {os.path.abspath(arquivo_final)}")
-        
-        print("🗑️ Limpando cache...")
-        shutil.rmtree(pasta_cache)
-        
-        return True
+# --- FLUXO PRINCIPAL ---
+async def find_latest_binary(session):
+    low, high, last = 7500, 9000, 0
+    print(f"📡 Buscando última edição (Binária {low}-{high})...")
+    while low <= high:
+        mid = (low + high) // 2
+        if await fetch_with_retry(session, f"{BASE_URL}/apifront/portal/edicoes/pdf_diario/{mid}/1", "HEAD"):
+            last, low = mid, mid + 1
+        else: high = mid - 1
+    return last
 
 async def main():
-    # Carrega edições já baixadas
-    edicoes_baixadas = carregar_edicoes_baixadas()
-    print(f"📚 Edições já baixadas: {len(edicoes_baixadas)}")
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    if TEMP_DIR.exists(): shutil.rmtree(TEMP_DIR)
     
-    connector = aiohttp.TCPConnector(limit=10, force_close=True)
-    async with aiohttp.ClientSession(headers=HEADERS, timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECS), connector=connector) as session:
-        ultima_edicao = await descobrir_ultima_edicao_site(session)
-    
-    if not ultima_edicao:
-        print("❌ Não foi possível determinar a última edição")
-        return
-    
-    # Define range das 10 últimas
-    primeira_edicao = max(7000, ultima_edicao - 9)
-    edicoes = range(primeira_edicao, ultima_edicao + 1)
-    
-    # Filtra apenas edições novas
-    edicoes_novas = [ed for ed in edicoes if ed not in edicoes_baixadas]
-    
-    if not edicoes_novas:
-        print("\n✨ Nenhuma edição nova para baixar!")
-        return
-    
-    print(f"\n📋 Total de edições novas: {len(edicoes_novas)}")
-    print(f"📅 Edições: {min(edicoes_novas)} até {max(edicoes_novas)}")
+    # Carrega memória
+    ja_baixados = carregar_historico()
+    print(f"💾 Histórico carregado: {len(ja_baixados)} edições já salvas.")
 
-    for ed in edicoes_novas:
-        sucesso = await processar_edicao(ed)
-        if sucesso:
-            edicoes_baixadas.add(ed)
-            salvar_edicoes_baixadas(edicoes_baixadas)
+    async with aiohttp.ClientSession(headers=HEADERS, connector=aiohttp.TCPConnector(limit=0)) as session:
+        latest = await find_latest_binary(session)
+        if not latest: return
+
+        # Define alvo: últimas 10 edições que NÃO estão no histórico
+        target_ids = []
+        curr = latest
+        count = 0
+        while count < 10 and curr > 6000:
+            if curr not in ja_baixados:
+                target_ids.append(curr)
+                count += 1
+            curr -= 1
         
-        print("⏳ Aguardando 1 segundo...")
-        await asyncio.sleep(1)
-    
-    print(f"\n✅ CONCLUÍDO! {len(edicoes_novas)} edições novas baixadas")
+        if not target_ids:
+            print("✨ Nenhuma edição nova para baixar hoje.")
+            return
+
+        print(f"🎯 Alvo: {target_ids}")
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        sucessos = []
+
+        for ed_id in target_ids:
+            # Verifica existência antes de baixar
+            if await fetch_with_retry(session, f"{BASE_URL}/apifront/portal/edicoes/pdf_diario/{ed_id}/1", "HEAD"):
+                if await process_edition(session, ed_id, sem, None):
+                    sucessos.append(ed_id)
+        
+        # Salva o que conseguiu baixar no histórico
+        if sucessos:
+            salvar_historico(sucessos)
+            print(f"💾 Histórico atualizado com: {sucessos}")
+
+    if TEMP_DIR.exists(): shutil.rmtree(TEMP_DIR)
 
 if __name__ == "__main__":
     asyncio.run(main())
