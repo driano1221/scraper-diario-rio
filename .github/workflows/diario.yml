@@ -1,40 +1,99 @@
-name: Scraper Diário Oficial
+name: Scraper Diário Rio
 
 on:
   schedule:
-    # Roda todo dia às 09:00 UTC (que é 06:00 da manhã no Brasil)
-    # Cron syntax: minuto hora dia mês dia-da-semana
-    - cron: '0 9 * * *'
-  workflow_dispatch: # Permite você clicar num botão para rodar manualmente se quiser
-
-permissions:
-  contents: write
+    - cron: '0 14 * * *'  # 11h BRT
+  workflow_dispatch:
 
 jobs:
-  baixar-diarios:
+  scrape:
     runs-on: ubuntu-latest
-
+    
     steps:
-      - name: 📥 Baixar código
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+    
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Instalar dependências
+      run: pip install -r requirements.txt
+    
+    - name: Rodar scraper
+      run: python scraper.py
+    
+    - name: Verificar se há PDFs novos
+      id: check_files
+      run: |
+        if [ -d "Diarios_Rio" ] && [ "$(ls -A Diarios_Rio/*.pdf 2>/dev/null)" ]; then
+          echo "has_files=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_files=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Zipar PDFs
+      if: steps.check_files.outputs.has_files == 'true'
+      run: |
+        cd Diarios_Rio
+        zip -r ../diarios_$(date +'%Y-%m-%d').zip *.pdf
+    
+    - name: Criar Release
+      if: steps.check_files.outputs.has_files == 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ github.run_number }}-$(date +'%Y%m%d')
+        name: Diários $(date +'%d/%m/%Y')
+        body: |
+          📅 Data: $(date +'%d/%m/%Y %H:%M')
+          📦 Edições novas coletadas
+        files: diarios_*.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Commitar controle de edições
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add edicoes_baixadas.json
+        git diff --staged --quiet || git commit -m "Atualiza controle de edições"
+        git push
+```
 
-      - name: 🐍 Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+---
 
-      - name: 📦 Instalar dependências
-        run: |
-          pip install -r requirements.txt
+## **🎯 O QUE MUDOU**
 
-      - name: 🚀 Rodar Scraper
-        run: python new.py
+✅ **Arquivo de controle:** `edicoes_baixadas.json`
+- Guarda lista de edições já baixadas
+- Commitado no repositório
 
-      # OPÇÃO 1: SALVAR COMO ARTEFATO (Recomendado)
-      # Os arquivos ficam disponíveis para download no site do GitHub por 90 dias
-      - name: 💾 Upload dos PDFs (Artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: Diarios-Rio-PDFs
-          path: Diarios_Rio_PDF/
-          retention-days: 10
+✅ **Lógica inteligente:**
+- Só baixa edições NOVAS
+- Evita duplicatas
+
+✅ **Eficiência:**
+- Se já tem tudo: não gasta minutos
+- Se tem 1 nova: baixa só 1
+
+---
+
+## **📊 EXEMPLO PRÁTICO**
+
+**Hoje (primeira vez):**
+```
+Baixa: 7688-7697 (10 edições)
+Arquivo: edicoes_baixadas.json = [7688,7689,...,7697]
+```
+
+**Amanhã:**
+```
+Última: 7698
+Range: 7689-7698
+Já tem: 7689-7697
+Baixa só: 7698 (1 edição) ✅
+```
+
+**Depois de amanhã:**
+```
+Última: 7699
+Baixa só: 7699 (1 edição) ✅
