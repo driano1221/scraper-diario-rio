@@ -2,59 +2,63 @@ name: Scraper Diário Rio
 
 on:
   schedule:
-    - cron: '0 14 * * *'  # 11h BRT
-  workflow_dispatch:
+    - cron: '0 11 * * *'  # 08:00 AM no Brasil (UTC-3)
+  workflow_dispatch:      # Botão manual
+
+permissions:
+  contents: write  # Permite criar Releases e commitar o JSON
 
 jobs:
-  scrape:
+  scrape-and-release:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - uses: actions/setup-python@v5
+    - name: 📥 Checkout do código
+      uses: actions/checkout@v4
+
+    - name: 🐍 Configurar Python
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     
-    - name: Instalar dependências
+    - name: 📦 Instalar dependências
       run: pip install -r requirements.txt
     
-    - name: Rodar scraper
+    - name: 🚀 Rodar Scraper
       run: python scraper.py
-    
-    - name: Verificar se há PDFs novos
+
+    - name: 💾 Verificar se há novos arquivos
       id: check_files
       run: |
-        if [ -d "Diarios_Rio" ] && [ "$(ls -A Diarios_Rio/*.pdf 2>/dev/null)" ]; then
+        if [ -d "Diarios_Rio_PDF" ] && [ "$(ls -A Diarios_Rio_PDF/*.pdf 2>/dev/null)" ]; then
           echo "has_files=true" >> $GITHUB_OUTPUT
+          echo "Arquivos encontrados!"
         else
           echo "has_files=false" >> $GITHUB_OUTPUT
+          echo "Nenhum PDF novo baixado."
         fi
-    
-    - name: Zipar PDFs
+
+    - name: 📝 Salvar Histórico (Commit JSON)
       if: steps.check_files.outputs.has_files == 'true'
       run: |
-        cd Diarios_Rio
-        zip -r ../diarios_$(date +'%Y-%m-%d').zip *.pdf
-    
-    - name: Criar Release
+        git config --global user.name "GitHub Actions Bot"
+        git config --global user.email "actions@github.com"
+        git add historico.json
+        git commit -m "🤖 Atualiza histórico de downloads" || echo "Nada para commitar"
+        git push
+
+    - name: 📦 Zipar PDFs
+      if: steps.check_files.outputs.has_files == 'true'
+      run: |
+        cd Diarios_Rio_PDF
+        zip -r ../diarios_rio_$(date +'%Y-%m-%d').zip *.pdf
+
+    - name: 🏷️ Criar Release
       if: steps.check_files.outputs.has_files == 'true'
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: v${{ github.run_number }}-$(date +'%Y%m%d')
+        tag_name: v${{ github.run_number }}
         name: Diários $(date +'%d/%m/%Y')
-        body: |
-          📅 Data: $(date +'%d/%m/%Y %H:%M')
-          📦 Edições novas coletadas
-        files: diarios_*.zip
+        files: diarios_rio_*.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Commitar controle de edições
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add edicoes_baixadas.json
-        git diff --staged --quiet || git commit -m "Atualiza controle de edições"
-        git push
-
